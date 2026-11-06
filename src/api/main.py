@@ -1,27 +1,46 @@
-from fastapi import FastAPI, HTTPException, Path
+from fastapi import FastAPI, HTTPException, Path, Depends
 from pydantic import BaseModel
-from datetime import date
+from sqlalchemy.orm import Session
+from datetime import date, datetime
 from decimal import Decimal
-from src.domain.contrato import Contrato, ServicioExtra, EstadoContrato
+import csv
+import os
+
+
+from src.domain.contrato import Contrato, EstadoContrato
 from src.domain.specifications import ContratoAdicionalSpecification, PresupuestoSpecification
 
+
+from src.infrastructure.database import engine, get_db, Base
+from src.infrastructure.models import ContratoModel
+
 app = FastAPI(
-    title="API Eventos Nova",
-    description="Implementación DDD y CQRS para Producto Integrador de Aprendizaje (PIA)",
-    version="1.0.0"
+    title="Eventos Nova",
+    description="Implementación PIA",
 )
 
-# Simulador de Base de Datos en memoria para probar la lógica
-fake_db = {
-    "EVT-001": Contrato(
-        contrato_id="EVT-001",
-        cliente_id="CLI-999",
-        fecha_evento=date(2026, 12, 15),
-        costo_base=Decimal("10000.00")
-    )
-}
+@app.on_event("startup")
+def startup_event():
+    Base.metadata.create_all(bind=engine)
+    
+    db = next(get_db())
+    if db.query(ContratoModel).count() == 0:
+        csv_path = "data/contratos.csv"
+        if os.path.exists(csv_path):
+            with open(csv_path, mode='r', encoding='utf-8') as file:
+                reader = csv.DictReader(file)
+                for row in reader:
+                    nuevo_contrato = ContratoModel(
+                        contrato_id=row['contrato_id'],
+                        cliente_id=row['cliente_id'],
+                        fecha_evento=datetime.strptime(row['fecha_evento'], '%Y-%m-%d').date(),
+                        costo_base=Decimal(row['costo_base']),
+                        estado=row.get('estado', 'COTIZADO')
+                    )
+                    db.add(nuevo_contrato)
+            db.commit()
+            print("Datos iniciales del CSV cargados exitosamente.")
 
-# --- Esquemas de Pydantic (Para Swagger UI) ---
 class AprobarRequest(BaseModel):
     monto_recibido: Decimal
 
@@ -31,74 +50,72 @@ class AgregarServicioRequest(BaseModel):
     fecha_actual: date
     presupuesto_maximo_cliente: Decimal
 
-# --- Endpoints ---
 
 @app.post("/contratos/{contrato_id}/aprobar", tags=["Coordinador"], status_code=200)
 def aprobar_cotizacion(
     monto_pago: AprobarRequest,
-    contrato_id: str = Path(..., description="ID del contrato (ej. EVT-001)")
+    contrato_id: str = Path(...),
+    db: Session = Depends(get_db)
 ):
-    """
-    **Aprobar Cotización Inicial**
-    Valida el anticipo recibido. Si cubre al menos el 25% del total, 
-    cambia el estado de COTIZADO a CONTRATADO.
-    """
-    contrato = fake_db.get(contrato_id)
-    if not contrato:
-        raise HTTPException(status_code=404, detail="Contrato no encontrado")
+
+    contrato_db = db.query(ContratoModel).filter(ContratoModel.contrato_id == contrato_id).first()
+    if not contrato_db:
+        raise HTTPException(status_code=404, detail="Contrato no encontrado en la base de datos")
+
+    contrato = Contrato(
+        contrato_id=contrato_db.contrato_id,
+        cliente_id=contrato_db.cliente_id,
+        fecha_evento=contrato_db.fecha_evento,
+        costo_base=contrato_db.costo_base
+    )
+    contrato.estado = EstadoContrato(contrato_db.estado)
 
     try:
-        # Lógica del Agregado
         contrato.aprobar_cotizacion(monto_pago.monto_recibido)
+        
+        contrato_db.estado = contrato.estado.value
+        contrato_db.anticipo_pagado = contrato.anticipo_pagado
+        db.commit()
+        
         return {
-            "mensaje": "Cotización aprobada y contrato activado exitosamente.",
-            "estado_actual": contrato.estado.value,
-            "anticipo_registrado": float(contrato.anticipo_pagado)
+            "mensaje": "Cotización aprobada y contrato activado.",
+            "estado_actual": contrato_db.estado,
+            "anticipo_registrado": float(contrato_db.anticipo_pagado)
         }
     except ValueError as e:
-        # Retorna 400 o 422 si se rompe la regla de negocio
         raise HTTPException(status_code=422, detail=str(e))
 
 
 @app.post("/contratos/{contrato_id}/servicios-extra", tags=["Coordinador"], status_code=201)
 def agregar_servicio_extra(
     request: AgregarServicioRequest,
-    contrato_id: str = Path(..., description="ID del contrato (ej. EVT-001)")
+    contrato_id: str = Path(...),
+    db: Session = Depends(get_db)
 ):
-    """
-    **Agregar Servicio Adicional**
-    Aplica el patrón Specification para validar dos reglas de negocio:
-    1. Faltan más de 5 días para el evento.
-    2. El costo no excede el presupuesto autorizado por el cliente.
-    """
-    contrato = fake_db.get(contrato_id)
-    if not contrato:
+    contrato_db = db.query(ContratoModel).filter(ContratoModel.contrato_id == contrato_id).first()
+    if not contrato_db:
         raise HTTPException(status_code=404, detail="Contrato no encontrado")
 
-    # 1. Ejecutar Specification de Tiempo
+    contrato = Contrato(
+        contrato_id=contrato_db.contrato_id,
+        cliente_id=contrato_db.cliente_id,
+        fecha_evento=contrato_db.fecha_evento,
+        costo_base=contrato_db.costo_base
+    )
+
+
     regla_tiempo = ContratoAdicionalSpecification(request.fecha_actual)
     if not regla_tiempo.is_satisfied_by(contrato):
-        raise HTTPException(
-            status_code=409, 
-            detail="Cambio rechazado: Faltan 5 días o menos para el evento."
-        )
+        raise HTTPException(status_code=409, detail="Rechazado: Faltan 5 días o menos para el evento.")
 
-    # 2. Ejecutar Specification de Presupuesto
-    regla_presupuesto = PresupuestoSpecification(
-        request.presupuesto_maximo_cliente, request.costo
-    )
+    regla_presupuesto = PresupuestoSpecification(request.presupuesto_maximo_cliente, request.costo)
     if not regla_presupuesto.is_satisfied_by(contrato):
-        raise HTTPException(
-            status_code=409, 
-            detail="Límite financiero excedido: El servicio supera el presupuesto autorizado."
-        )
+        raise HTTPException(status_code=409, detail="Rechazado: El servicio supera el presupuesto autorizado.")
 
-    # Si pasa las Specifications, se agrega el servicio
-    nuevo_servicio = ServicioExtra(request.id_servicio, request.costo)
-    contrato.servicios_adicionales.append(nuevo_servicio)
+    contrato_db.costo_base += request.costo
+    db.commit()
 
     return {
-        "mensaje": "Servicio adicional enlazado al contrato exitosamente.",
-        "nuevo_total": float(contrato.calcular_total()),
-        "cantidad_servicios_extra": len(contrato.servicios_adicionales)
+        "mensaje": "Servicio adicional validado e integrado al contrato.",
+        "nuevo_costo_base": float(contrato_db.costo_base)
     }
